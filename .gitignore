@@ -1,0 +1,85 @@
+# Артефакты сборки Pelles C
+output/
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.res
+*.map
+*.s
+*.asm
+
+# Готовые бинарники (кроме PingWWW.exe, который публикуется)
+# *.exe
+# *.dll
+
+# Каталоги сборки
+Build/
+build/
+Bin/
+bin/
+Out/
+out/
+obj/
+Debug/
+Release/
+x64/
+Win32/
+
+# Файлы Pelles C IDE (кроме .ppj)
+*.ppw
+*.pou
+*.tag
+*.prj
+*.dsk
+*.pj
+*.prf
+
+# Файлы Visual Studio
+.vs/
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sln
+*.suo
+*.user
+*.opendb
+*.aps
+*.ncb
+
+# Файлы MinGW / GCC
+*.d
+*.a
+*.so
+*.dll.a
+
+# Прочий мусор компиляторов
+*.idb
+*.pch
+*.gch
+*.ipch
+*.tlog
+*.log
+
+# Временные файлы ОС
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+
+# Резервные копии редакторов
+*~
+*.bak
+*.swp
+*.swo
+*.tmp
+*.orig
+*.rej
+
+# Настройки редакторов
+.vscode/
+.idea/
+*.code-workspace
