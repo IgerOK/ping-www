@@ -1,5 +1,9 @@
 # Ping WWW
 
+![License](https://img.shields.io/badge/License-MIT-blue.svg)
+![Platform](https://img.shields.io/badge/Platform-Windows%207%2F10%2F11-lightgrey.svg)
+![Language](https://img.shields.io/badge/Language-C-blue.svg)
+
 Мини-индикатор доступа в интернет в виде круглого полупрозрачного окошка поверх всех окон.
 
 Реализован на C под Pelles C (Win32 GUI), без внешних зависимостей, с попиксельным антиалиасингом.
