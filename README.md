@@ -51,13 +51,13 @@
 
 ![Compiler → Preprocessor](compiler-defines.png)
 
-5. **Project → Options → Linker** → Library and object files: `kernel32.lib user32.lib gdi32.lib comctl32.lib wininet.lib`
+4. **Project → Options → Linker** → Library and object files: `kernel32.lib user32.lib gdi32.lib comctl32.lib wininet.lib`
 
 
 ![Linker](linker-libraries.png)
 
 
-6. **Build → Build**. На выходе — `PingWWW.exe` без внешних зависимостей
+5. **Build → Build**. На выходе — `PingWWW.exe` без внешних зависимостей
 
 Файл `PingWWW.c` сохранять в **UTF-8 with BOM**.
 
