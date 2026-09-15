@@ -1,5 +1,5 @@
 /*
-PingWWW.c — мини-индикатор интернета (аналог PingWWW.ahk)
+PingWWW.c — мини-индикатор интернета
 Компилятор: Pelles C 14.50 (также MinGW / MSVC)
 Проект: Win32 Application (GUI)
 Subsystem: Windows, Entry point: (авто)
