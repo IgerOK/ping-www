@@ -1,649 +1,694 @@
 /*
+https://github.com/IgerOK/ping-www
 PingWWW.c — мини-индикатор интернета
 Компилятор: Pelles C 14.50 (также MinGW / MSVC)
 Проект: Win32 Application (GUI)
 Subsystem: Windows, Entry point: (авто)
-Libraries: kernel32.lib user32.lib gdi32.lib comctl32.lib wininet.lib advapi32.lib
+Libraries: kernel32.lib user32.lib gdi32.lib comctl32.lib wininet.lib advapi32.lib iphlpapi.lib
 Defines:   UNICODE _UNICODE
 Файл сохранять в UTF-8 with BOM.
 */
-#define WIN32_LEAN_AND_MEAN
-#define _WIN32_WINNT 0x0601        /* Windows 7+ */
+
+// СТРОГО ДО ВСЕХ ИНКЛУДОВ: Установка таргетинга на Windows 7+ для доступа к NetIO API
+#ifndef WINVER
+#define WINVER 0x0601
+#endif
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
+#ifndef NTDDI_VERSION
+#define NTDDI_VERSION 0x06010000
+#endif
+
 #ifndef UNICODE
 #define UNICODE
 #endif
 #ifndef _UNICODE
 #define _UNICODE
 #endif
+
+#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <commctrl.h>
 #include <wininet.h>
+#include <commctrl.h>
+#include <wchar.h>
+#include <string.h>
+
+// Порядок подключения заголовков сети важен для Pelles C
+#include <iphlpapi.h>
+#include <netioapi.h> 
 #include <math.h>
 
-/* ---- Параметры -------------------------------------------------- */
-#define TIMER_CHECK         1
-#define WM_APP_CHECK_DONE   (WM_APP + 1)
+// Константы окон и идентификаторы таймеров
+#define WINDOW_CLASS_NAME L"PingWWW_Class"
+#define POPUP_CLASS_NAME L"PingWWW_Popup_Class"
+#define WM_APP_CHECK_DONE (WM_APP + 1)
+#define ID_TIMER_CHECK 1
+#define ID_TIMER_POPUP 2
+#define ID_TIMER_SPEED_TRACK 3
 
-static const int SIZES[] = { 30, 50, 70 };
-#define SIZES_COUNT (int)(sizeof(SIZES) / sizeof(SIZES[0]))
+// Ключ реестра для сохранения состояния программы
+#define REG_KEY_PATH L"Software\\PingWWW"
 
-static const int   INTERVAL_OFFLINE = 1000;   /* мс */
-static const int   INTERVAL_ONLINE  = 5000;   /* мс */
-static const DWORD HTTP_TIMEOUT     = 1000;   /* мс */
+// Глобальные переменные состояния приложения
+HWND g_hwndMain = NULL;
+HWND g_hwndPopup = NULL;
+BOOL g_isNetworkUp = TRUE;
+BOOL g_isChecking = FALSE;
+DWORD g_startTick = 0;
 
-static const wchar_t* CHECK_URL =
-    L"http://www.msftconnecttest.com/connecttest.txt";
-static const wchar_t* REPO_URL  = L"https://github.com/IgerOK/ping-www";
+// Пользовательские настройки (сохраняются в реестре)
+int g_posX = 50;
+int g_posY = 50;
+int g_sizeLevel = 1; // 0 = 30px, 1 = 50px, 2 = 70px
+BOOL g_isTransparent = TRUE; // TRUE = 50%, FALSE = 100%
 
-/* ---- Состояние -------------------------------------------------- */
-static int   g_sizeLevel   = 1;               /* 50 px */
-static BOOL  g_transparent = TRUE;
-static BOOL  g_online      = FALSE;
-static BOOL  g_firstCheckDone = FALSE;
-static BOOL  g_dragging    = FALSE;
+// Переменные для перетаскивания окна мышью
+BOOL g_isDragging = FALSE;
+POINT g_dragStartMouse;
+POINT g_dragStartWindow;
 
-/* Всплывающее окно при перетаскивании */
-static HWND      g_hPopup     = NULL;
-static BOOL      g_popupShown = FALSE;
-static ULONGLONG g_startTick  = 0;
-static POINT     g_dragStart;
-static RECT      g_dragOrigin;
+// Дескрипторы графических объектов (шрифты)
+HFONT g_hFontNormal = NULL;
 
-/* ---- Утилиты ---------------------------------------------------- */
-static COLORREF CurrentColor(void)
-{
-    if (!g_firstCheckDone) return RGB(140, 140, 140); /* Серый: идет первая проверка */
-    return g_online ? RGB(0, 180, 0) : RGB(220, 30, 30);
+// Глобальные переменные для учета сетевого трафика
+ULONGLONG g_initialInBytes = 0;
+ULONGLONG g_initialOutBytes = 0;
+
+// Переменные для расчета мгновенной и чистой средней скорости
+ULONGLONG g_lastInBytes = 0;
+ULONGLONG g_lastOutBytes = 0;
+double g_currentSpeedInKb = 0.0;
+double g_currentSpeedOutKb = 0.0;
+DWORD g_activeInSeconds = 0;
+DWORD g_activeOutSeconds = 0;
+
+// Массив доступных диаметров индикатора
+const int g_sizes[] = { 30, 50, 70 };
+
+// Определение прототипов функций
+void LoadSettings(void);
+void SaveSettings(void);
+void ClampPositionToMonitor(int* x, int* y, int size);
+void GetTotalNetworkBytes(ULONGLONG* inBytes, ULONGLONG* outBytes);
+DWORD WINAPI NetworkCheckThread(LPVOID lpParam);
+void UpdateMainLayeredWindow(void);
+void UpdatePopupLayeredWindow(void);
+void FormatSpeedString(wchar_t* buffer, size_t bufferSize, const wchar_t* prefix, double currentKb, double avgKb);
+void RecreateFontsForDpi(HWND hwnd);
+
+// Функция сбора сетевой статистики через классический IP Helper API (совместимый со всеми версиями SDK)
+void GetTotalNetworkBytes(ULONGLONG* inBytes, ULONGLONG* outBytes) {
+    *inBytes = 0;
+    *outBytes = 0;
+    
+    ULONG dwSize = 0;
+    if (GetIfTable(NULL, &dwSize, FALSE) == ERROR_INSUFFICIENT_BUFFER) {
+        MIB_IFTABLE* pIfTable = (MIB_IFTABLE*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, dwSize);
+        if (pIfTable) {
+            if (GetIfTable(pIfTable, &dwSize, FALSE) == NO_ERROR) {
+                for (ULONG i = 0; i < pIfTable->dwNumEntries; i++) {
+                    if (pIfTable->table[i].dwType != IF_TYPE_SOFTWARE_LOOPBACK && 
+                        pIfTable->table[i].dwOperStatus == MIB_IF_OPER_STATUS_OPERATIONAL) {
+                        *inBytes += pIfTable->table[i].dwInOctets;
+                        *outBytes += pIfTable->table[i].dwOutOctets;
+                    }
+                }
+            }
+            HeapFree(GetProcessHeap(), 0, pIfTable);
+        }
+    }
 }
 
-/* ---- Реестр: сохранение / загрузка состояния --------------------- */
-#define REG_KEY  L"Software\\PingWWW"
-
-static void SaveState(HWND hwnd)
-{
+// Загрузка настроек приложения из реестра Windows
+void LoadSettings(void) {
     HKEY hKey;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_KEY,
-                        0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS)
-    {
-        RECT rc;
-        GetWindowRect(hwnd, &rc);
-        DWORD x = (DWORD)rc.left;
-        DWORD y = (DWORD)rc.top;
-        DWORD sizeLevel = (DWORD)g_sizeLevel;
-        DWORD transparent = g_transparent ? 1 : 0;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_KEY_PATH, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        DWORD dwType, dwSize, dwValue;
+        
+        dwSize = sizeof(dwValue);
+        if (RegQueryValueExW(hKey, L"PosX", NULL, &dwType, (BYTE*)&dwValue, &dwSize) == ERROR_SUCCESS) {
+            g_posX = (int)dwValue;
+        }
+        
+        dwSize = sizeof(dwValue);
+        if (RegQueryValueExW(hKey, L"PosY", NULL, &dwType, (BYTE*)&dwValue, &dwSize) == ERROR_SUCCESS) {
+            g_posY = (int)dwValue;
+        }
+        
+        dwSize = sizeof(dwValue);
+        if (RegQueryValueExW(hKey, L"SizeLevel", NULL, &dwType, (BYTE*)&dwValue, &dwSize) == ERROR_SUCCESS) {
+            g_sizeLevel = (int)dwValue;
+            if (g_sizeLevel < 0 || g_sizeLevel > 2) g_sizeLevel = 1;
+        }
+        
+        dwSize = sizeof(dwValue);
+        if (RegQueryValueExW(hKey, L"Transparent", NULL, &dwType, (BYTE*)&dwValue, &dwSize) == ERROR_SUCCESS) {
+            g_isTransparent = (BOOL)dwValue;
+        }
+        
+        RegCloseKey(hKey);
+    }
+    ClampPositionToMonitor(&g_posX, &g_posY, g_sizes[g_sizeLevel]);
+}
 
-        RegSetValueExW(hKey, L"PosX", 0, REG_DWORD, (const BYTE*)&x, sizeof(x));
-        RegSetValueExW(hKey, L"PosY", 0, REG_DWORD, (const BYTE*)&y, sizeof(y));
-        RegSetValueExW(hKey, L"SizeLevel", 0, REG_DWORD, (const BYTE*)&sizeLevel, sizeof(sizeLevel));
-        RegSetValueExW(hKey, L"Transparent", 0, REG_DWORD, (const BYTE*)&transparent, sizeof(transparent));
+// Сохранение настроек приложения в реестр Windows
+void SaveSettings(void) {
+    HKEY hKey;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_KEY_PATH, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+        DWORD dwValue;
+        
+        dwValue = (DWORD)g_posX;
+        RegSetValueExW(hKey, L"PosX", 0, REG_DWORD, (BYTE*)&dwValue, sizeof(dwValue));
+        
+        dwValue = (DWORD)g_posY;
+        RegSetValueExW(hKey, L"PosY", 0, REG_DWORD, (BYTE*)&dwValue, sizeof(dwValue));
+        
+        dwValue = (DWORD)g_sizeLevel;
+        RegSetValueExW(hKey, L"SizeLevel", 0, REG_DWORD, (BYTE*)&dwValue, sizeof(dwValue));
+        
+        dwValue = (DWORD)g_isTransparent;
+        RegSetValueExW(hKey, L"Transparent", 0, REG_DWORD, (BYTE*)&dwValue, sizeof(dwValue));
+        
         RegCloseKey(hKey);
     }
 }
 
-static BOOL LoadState(int* x, int* y)
-{
-    HKEY hKey;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_KEY,
-                      0, KEY_READ, &hKey) != ERROR_SUCCESS)
-        return FALSE;
-
-    DWORD xVal = 0, yVal = 0, sizeVal = 1, transVal = 1;
-    DWORD size = sizeof(DWORD), type = 0;
-    
-    BOOL okX = (RegQueryValueExW(hKey, L"PosX", NULL, &type, (BYTE*)&xVal, &size) == ERROR_SUCCESS && type == REG_DWORD);
-    size = sizeof(DWORD); type = 0;
-    BOOL okY = (RegQueryValueExW(hKey, L"PosY", NULL, &type, (BYTE*)&yVal, &size) == ERROR_SUCCESS && type == REG_DWORD);
-    
-    /* Читаем размер (защита от некорректных значений в реестре) */
-    size = sizeof(DWORD); type = 0;
-    if (RegQueryValueExW(hKey, L"SizeLevel", NULL, &type, (BYTE*)&sizeVal, &size) == ERROR_SUCCESS && type == REG_DWORD) {
-        if (sizeVal < (DWORD)SIZES_COUNT) g_sizeLevel = (int)sizeVal;
-    }
-
-    /* Читаем прозрачность */
-    size = sizeof(DWORD); type = 0;
-    if (RegQueryValueExW(hKey, L"Transparent", NULL, &type, (BYTE*)&transVal, &size) == ERROR_SUCCESS && type == REG_DWORD) {
-        g_transparent = (transVal != 0) ? TRUE : FALSE;
-    }
-
-    RegCloseKey(hKey);
-
-    if (okX && okY) {
-        *x = (int)xVal;
-        *y = (int)yVal;
-        return TRUE;
-    }
-    return FALSE;
-}
-
-static void ClampPosition(int* x, int* y, int size)
-{
+// Ограничение координат окна в пределах рабочей области текущего монитора
+void ClampPositionToMonitor(int* x, int* y, int size) {
     POINT pt = { *x + size / 2, *y + size / 2 };
-    HMONITOR hm = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO mi; mi.cbSize = sizeof(mi);
-    GetMonitorInfoW(hm, &mi);
-
-    if (size >= mi.rcWork.right - mi.rcWork.left)
-        *x = mi.rcWork.left;
-    else if (*x < mi.rcWork.left)
-        *x = mi.rcWork.left;
-    else if (*x + size > mi.rcWork.right)
-        *x = mi.rcWork.right - size;
-
-    if (size >= mi.rcWork.bottom - mi.rcWork.top)
-        *y = mi.rcWork.top;
-    else if (*y < mi.rcWork.top)
-        *y = mi.rcWork.top;
-    else if (*y + size > mi.rcWork.bottom)
-        *y = mi.rcWork.bottom - size;
-}
-
-/* ---- Отрисовка индикатора с попиксельной альфой ------------------ */
-static void RenderWindow(HWND hwnd, int size)
-{
-    HDC hdcScreen = GetDC(NULL);
-    HDC hdcMem    = CreateCompatibleDC(hdcScreen);
-
-    BITMAPINFO bmi;
-    ZeroMemory(&bmi, sizeof(bmi));
-    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth       = size;
-    bmi.bmiHeader.biHeight      = -size;     /* top-down */
-    bmi.bmiHeader.biPlanes      = 1;
-    bmi.bmiHeader.biBitCount    = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    void*   bits   = NULL;
-    HBITMAP hbm    = CreateDIBSection(hdcScreen, &bmi, DIB_RGB_COLORS,
-                                      &bits, NULL, 0);
-    HBITMAP hbmOld = (HBITMAP)SelectObject(hdcMem, hbm);
-
-    COLORREF col       = CurrentColor();
-    int      baseAlpha = g_transparent ? 128 : 255;
-    BYTE r = GetRValue(col);
-    BYTE g = GetGValue(col);
-    BYTE b = GetBValue(col);
-
-    float cx = size / 2.0f;
-    float cy = size / 2.0f;
-    float R  = size / 2.0f;
-
-    DWORD* px = (DWORD*)bits;
-    for (int y = 0; y < size; y++) {
-        for (int x = 0; x < size; x++) {
-            float dx = (x + 0.5f) - cx;
-            float dy = (y + 0.5f) - cy;
-            float d  = sqrtf(dx * dx + dy * dy);
-
-            float a = R + 0.5f - d;
-            if (a < 0.0f) a = 0.0f;
-            if (a > 1.0f) a = 1.0f;
-
-            BYTE alpha = (BYTE)(a * baseAlpha);
-
-            BYTE pr = (BYTE)(r * alpha / 255);
-            BYTE pg = (BYTE)(g * alpha / 255);
-            BYTE pb = (BYTE)(b * alpha / 255);
-
-            px[y * size + x] = ((DWORD)alpha << 24)
-                             | ((DWORD)pr    << 16)
-                             | ((DWORD)pg    <<  8)
-                             |  (DWORD)pb;
-        }
+    HMONITOR hMonitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi;
+    mi.cbSize = sizeof(MONITORINFO);
+    if (GetMonitorInfoW(hMonitor, &mi)) {
+        if (*x < mi.rcWork.left) *x = mi.rcWork.left;
+        if (*x + size > mi.rcWork.right) *x = mi.rcWork.right - size;
+        if (*y < mi.rcWork.top) *y = mi.rcWork.top;
+        if (*y + size > mi.rcWork.bottom) *y = mi.rcWork.bottom - size;
     }
-
-    POINT ptSrc = { 0, 0 };
-    SIZE  sz    = { size, size };
-    BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
-
-    UpdateLayeredWindow(hwnd, hdcScreen, NULL, &sz,
-                        hdcMem, &ptSrc, 0, &bf, ULW_ALPHA);
-
-    SelectObject(hdcMem, hbmOld);
-    DeleteObject(hbm);
-    DeleteDC(hdcMem);
-    ReleaseDC(NULL, hdcScreen);
 }
 
-/* Покрытие скруглённого прямоугольника (0..1) для антиалиасинга */
-static float RRectCoverage(float px, float py, float w, float h, float r)
-{
-    float nx = px, ny = py;
-    if (nx < r)     nx = r;     else if (nx > w - r) nx = w - r;
-    if (ny < r)     ny = r;     else if (ny > h - r) ny = h - r;
-
-    float dx = px - nx, dy = py - ny;
-    float d  = sqrtf(dx * dx + dy * dy);
-
-    float a = r + 0.5f - d;
-    if (a < 0.0f) a = 0.0f;
-    if (a > 1.0f) a = 1.0f;
-    return a;
-}
-
-/* Позиционирование с сохранением центра и прижатием к рабочей области */
-static void ApplySize(HWND hwnd)
-{
-    int size = SIZES[g_sizeLevel];
-    RECT rc;
-    GetWindowRect(hwnd, &rc);
-    int cx = (rc.left + rc.right)  / 2;
-    int cy = (rc.top  + rc.bottom) / 2;
-    int x  = cx - size / 2;
-    int y  = cy - size / 2;
-
-    ClampPosition(&x, &y, size);
-
-    SetWindowPos(hwnd, NULL, x, y, size, size,
-                 SWP_NOZORDER | SWP_NOACTIVATE);
-    RenderWindow(hwnd, size);
-}
-
-/* ---- Всплывающее окно при перетаскивании ------------------------ */
-static HFONT MakeFont(int height, int weight)
-{
-    return CreateFontW(height, 0, 0, 0, weight, FALSE, FALSE, FALSE,
-                       DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                       CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                       DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-}
-
-static void RenderPopup(HWND hwnd)
-{
-    wchar_t up[64];
-    ULONGLONG mins = (GetTickCount64() - g_startTick) / 60000ULL;
-    wsprintfW(up, L"Uptime: %02u:%02u",
-              (UINT)(mins / 60), (UINT)(mins % 60));
-
-    static const wchar_t* HINT_LMB = L"2×ЛКМ — прозрачность";
-    static const wchar_t* HINT_ESC = L"Нажмите Esc для выхода из программы";
-
-    wchar_t hintRmb[64];
-    int n = wsprintfW(hintRmb, L"ПКМ — размер (");
-    for (int i = 0; i < SIZES_COUNT; i++)
-        n += wsprintfW(hintRmb + n, L"%s%d", i ? L"/" : L"", SIZES[i]);
-    wsprintfW(hintRmb + n, L")");
-
-    HDC hdcScreen = GetDC(NULL);
-    HDC hdcMem    = CreateCompatibleDC(hdcScreen);
-
-    HFONT fUrl  = MakeFont(-15, FW_NORMAL);
-    HFONT fUp   = MakeFont(-18, FW_SEMIBOLD);
-    HFONT fHint = MakeFont(-13, FW_NORMAL);
-
-    SelectObject(hdcMem, fUrl);
-    SIZE sUrl;
-    GetTextExtentPoint32W(hdcMem, REPO_URL, lstrlenW(REPO_URL), &sUrl);
-
-    SelectObject(hdcMem, fUp);
-    SIZE sUp;
-    GetTextExtentPoint32W(hdcMem, up, lstrlenW(up), &sUp);
-
-    SelectObject(hdcMem, fHint);
-    SIZE sH1, sH2, sH3;
-    GetTextExtentPoint32W(hdcMem, HINT_LMB, lstrlenW(HINT_LMB), &sH1);
-    GetTextExtentPoint32W(hdcMem, hintRmb,  lstrlenW(hintRmb),  &sH2);
-    GetTextExtentPoint32W(hdcMem, HINT_ESC, lstrlenW(HINT_ESC), &sH3);
-
-    const int padX = 12, padY = 10, gap = 6, sepGap = 8, radius = 9;
-
-    int w = sUrl.cx;
-    if (sUp.cx  > w) w = sUp.cx;
-    if (sH1.cx  > w) w = sH1.cx;
-    if (sH2.cx  > w) w = sH2.cx;
-    if (sH3.cx  > w) w = sH3.cx;
-    w += padX * 2;
-
-    int yUrl = padY;
-    int yUp  = yUrl + sUrl.cy + gap;
-    int ySep = yUp  + sUp.cy  + sepGap;
-    int yH1  = ySep + 1       + sepGap;
-    int yH2  = yH1  + sH1.cy  + gap;
-    int yH3  = yH2  + sH2.cy  + gap;
-    int h    = yH3  + sH3.cy  + padY;
-
-    BITMAPINFO bmi;
-    ZeroMemory(&bmi, sizeof(bmi));
-    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth       = w;
-    bmi.bmiHeader.biHeight      = -h;        /* top-down */
-    bmi.bmiHeader.biPlanes      = 1;
-    bmi.bmiHeader.biBitCount    = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    void*   bits   = NULL;
-    HBITMAP hbm    = CreateDIBSection(hdcScreen, &bmi, DIB_RGB_COLORS,
-                                      &bits, NULL, 0);
-    HBITMAP hbmOld = (HBITMAP)SelectObject(hdcMem, hbm);
-
-    RECT rcFill = { 0, 0, w, h };
-    HBRUSH bg = CreateSolidBrush(RGB(24, 26, 30));
-    FillRect(hdcMem, &rcFill, bg);
-    DeleteObject(bg);
-
-    RECT rcSep = { padX, ySep, w - padX, ySep + 1 };
-    HBRUSH sep = CreateSolidBrush(RGB(60, 60, 66));
-    FillRect(hdcMem, &rcSep, sep);
-    DeleteObject(sep);
-
-    SetBkMode(hdcMem, TRANSPARENT);
-
-    SelectObject(hdcMem, fUrl);
-    SetTextColor(hdcMem, RGB(140, 180, 255));
-    TextOutW(hdcMem, padX, yUrl, REPO_URL, lstrlenW(REPO_URL));
-
-    SelectObject(hdcMem, fUp);
-    SetTextColor(hdcMem, RGB(240, 240, 240));
-    TextOutW(hdcMem, padX, yUp, up, lstrlenW(up));
-
-    SelectObject(hdcMem, fHint);
-    SetTextColor(hdcMem, RGB(160, 165, 175));
-    TextOutW(hdcMem, padX, yH1, HINT_LMB, lstrlenW(HINT_LMB));
-    TextOutW(hdcMem, padX, yH2, hintRmb,  lstrlenW(hintRmb));
-    TextOutW(hdcMem, padX, yH3, HINT_ESC, lstrlenW(HINT_ESC));
-
-    DWORD* px = (DWORD*)bits;
-    for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-            DWORD  c = px[y * w + x];
-            float  a = RRectCoverage(x + 0.5f, y + 0.5f,
-                                     (float)w, (float)h, (float)radius);
-            if (a <= 0.0f) { px[y * w + x] = 0; continue; }
-
-            int A = (a >= 1.0f) ? 255 : (int)(a * 255.0f + 0.5f);
-            int r = (int)((c >> 16) & 0xFF);
-            int g = (int)((c >>  8) & 0xFF);
-            int b = (int)( c        & 0xFF);
-
-            px[y * w + x] = ((DWORD)A                      << 24)
-                          | ((DWORD)(r * A / 255)          << 16)
-                          | ((DWORD)(g * A / 255)          <<  8)
-                          |  (DWORD)(b * A / 255);
-        }
-    }
-
-    POINT ptSrc = { 0, 0 };
-    SIZE  sz    = { w, h };
-    BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
-
-    UpdateLayeredWindow(hwnd, hdcScreen, NULL, &sz,
-                        hdcMem, &ptSrc, 0, &bf, ULW_ALPHA);
-
-    SelectObject(hdcMem, hbmOld);
-    DeleteObject(hbm);
-    DeleteObject(fUrl);
-    DeleteObject(fUp);
-    DeleteObject(fHint);
-    DeleteDC(hdcMem);
-    ReleaseDC(NULL, hdcScreen);
-}
-
-static void MovePopup(HWND hwndMain)
-{
-    if (!g_hPopup) return;
-
-    RECT rm, rp;
-    GetWindowRect(hwndMain, &rm);
-    GetWindowRect(g_hPopup, &rp);
-    int w = rp.right - rp.left;
-    int h = rp.bottom - rp.top;
-
-    int x = rm.right + 6;
-    int y = rm.top;
-
-    HMONITOR hm = MonitorFromWindow(hwndMain, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO mi; mi.cbSize = sizeof(mi);
-    GetMonitorInfoW(hm, &mi);
-
-    if (x + w > mi.rcWork.right) x = rm.left - 6 - w;
-    if (x < mi.rcWork.left)      x = mi.rcWork.left;
-    if (y + h > mi.rcWork.bottom) y = mi.rcWork.bottom - h;
-    if (y < mi.rcWork.top)        y = mi.rcWork.top;
-
-    SetWindowPos(g_hPopup, HWND_TOPMOST, x, y, 0, 0,
-                 SWP_NOSIZE | SWP_NOACTIVATE);
-}
-
-static void ShowPopup(HWND hwndMain)
-{
-    if (!g_hPopup || g_popupShown) return;
-    RenderPopup(g_hPopup);
-    MovePopup(hwndMain);
-    ShowWindow(g_hPopup, SW_SHOWNOACTIVATE);
-    g_popupShown = TRUE;
-}
-
-static void HidePopup(void)
-{
-    if (!g_hPopup || !g_popupShown) return;
-    ShowWindow(g_hPopup, SW_HIDE);
-    g_popupShown = FALSE;
-}
-
-/* ---- Поток HTTP-проверки --------------------------------------- */
-static DWORD WINAPI CheckThread(LPVOID param)
-{
-    HWND hwnd = (HWND)param;
-    BOOL ok   = FALSE;
-
-    HINTERNET hInet = InternetOpenW(L"PingWWW/1.0",
-                                    INTERNET_OPEN_TYPE_PRECONFIG,
-                                    NULL, NULL, 0);
-    if (hInet) {
-        DWORD t = HTTP_TIMEOUT;
-        InternetSetOptionW(hInet, INTERNET_OPTION_CONNECT_TIMEOUT, &t, sizeof(t));
-        InternetSetOptionW(hInet, INTERNET_OPTION_SEND_TIMEOUT,    &t, sizeof(t));
-        InternetSetOptionW(hInet, INTERNET_OPTION_RECEIVE_TIMEOUT, &t, sizeof(t));
-
-        HINTERNET hUrl = InternetOpenUrlW(
-            hInet, CHECK_URL, NULL, 0,
-            INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_RELOAD, 0);
-
+// Потоковая функция для проверки доступности сети Интернет
+DWORD WINAPI NetworkCheckThread(LPVOID lpParam) {
+    HWND hwnd = (HWND)lpParam;
+    HINTERNET hSession = NULL, hUrl = NULL;
+    BOOL success = FALSE;
+    
+    // Используем INTERNET_OPEN_TYPE_DIRECT вместо PRECONFIG,
+    // чтобы запросы не блокировались системными прокси-серверами или VPN
+    hSession = InternetOpenW(L"PingWWW_Agent", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
+    if (hSession) {
+        DWORD timeout = 1500;
+        InternetSetOptionW(hSession, INTERNET_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
+        InternetSetOptionW(hSession, INTERNET_OPTION_SEND_TIMEOUT, &timeout, sizeof(timeout));
+        InternetSetOptionW(hSession, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
+        
+        // Флаги игнорирования кэша и принудительного перезапуска соединения
+        DWORD flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_IGNORE_REDIRECT_TO_HTTP | INTERNET_FLAG_IGNORE_REDIRECT_TO_HTTPS;
+        
+        hUrl = InternetOpenUrlW(hSession, L"http://www.msftconnecttest.com/connecttest.txt", NULL, 0, flags, 0);
         if (hUrl) {
-            DWORD status = 0, len = sizeof(status);
-            if (HttpQueryInfoW(hUrl,
-                               HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER,
-                               &status, &len, NULL))
-            {
-                ok = (status == 200);
+            DWORD statusCode = 0;
+            DWORD length = sizeof(statusCode);
+            if (HttpQueryInfoW(hUrl, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, &statusCode, &length, NULL)) {
+                if (statusCode == 200) {
+                    success = TRUE;
+                }
             }
             InternetCloseHandle(hUrl);
         }
-        InternetCloseHandle(hInet);
+        InternetCloseHandle(hSession);
     }
-
-    PostMessageW(hwnd, WM_APP_CHECK_DONE, ok ? 1 : 0, 0);
+    
+    PostMessageW(hwnd, WM_APP_CHECK_DONE, (WPARAM)success, 0);
     return 0;
 }
 
-static void StartCheck(HWND hwnd)
-{
-    CloseHandle(CreateThread(NULL, 0, CheckThread, hwnd, 0, NULL));
+// Пересоздание шрифтов с учётом DPI текущего монитора.
+// ВАЖНО: используем ANTIALIASED_QUALITY (grayscale-AA) вместо CLEARTYPE_QUALITY,
+// потому что при отрисовке в 32-битную DIB-секцию с последующим UpdateLayeredWindow
+// ClearType оставляет цветные субпиксельные каёмки — текст выглядит мыльным.
+void RecreateFontsForDpi(HWND hwnd) {
+    UINT dpi = 96;
+    HMODULE hUser = GetModuleHandleW(L"user32.dll");
+    if (hUser) {
+        typedef UINT (WINAPI *PFN_GetDpiForWindow)(HWND);
+        PFN_GetDpiForWindow pGetDpi = (PFN_GetDpiForWindow)GetProcAddress(hUser, "GetDpiForWindow");
+        if (pGetDpi && hwnd) {
+            dpi = pGetDpi(hwnd);
+        }
+    }
+
+    LOGFONTW lf;
+    ZeroMemory(&lf, sizeof(LOGFONTW));
+    lf.lfHeight  = -MulDiv(13, dpi, 96);
+    lf.lfWeight  = FW_NORMAL;
+    lf.lfQuality = ANTIALIASED_QUALITY;   // grayscale-AA, а не ClearType
+    wcsncpy(lf.lfFaceName, L"Segoe UI", 32);
+
+    if (g_hFontNormal) DeleteObject(g_hFontNormal);
+    g_hFontNormal = CreateFontIndirectW(&lf);
 }
 
-/* ---- Оконная процедура ----------------------------------------- */
-static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
-{
+// Функция форматирования вывода скоростей через наклонную черту
+void FormatSpeedString(wchar_t* buffer, size_t bufferSize, const wchar_t* prefix, double currentKb, double avgKb) {
+    wchar_t curStr[32];
+    wchar_t avgStr[32];
+
+    if (currentKb >= 1024.0) swprintf(curStr, 32, L"%.1f MB/s", currentKb / 1024.0);
+    else swprintf(curStr, 32, L"%.1f KB/s", currentKb);
+
+    if (avgKb >= 1024.0) swprintf(avgStr, 32, L"%.1f MB/s", avgKb / 1024.0);
+    else swprintf(avgStr, 32, L"%.1f KB/s", avgKb);
+
+    swprintf(buffer, bufferSize, L"%ls %ls / %ls", prefix, curStr, avgStr);
+}
+
+// Генерация круглого сглаженного индикатора
+void UpdateMainLayeredWindow(void) {
+    int size = g_sizes[g_sizeLevel];
+    HDC hdcScreen = GetDC(NULL);
+    HDC hdcMem = CreateCompatibleDC(hdcScreen);
+    int nSavedDC = SaveDC(hdcMem);
+    
+    BITMAPINFO bmi;
+    ZeroMemory(&bmi, sizeof(BITMAPINFO));
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = size;
+    bmi.bmiHeader.biHeight = size;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    
+    void* pvBits = NULL;
+    HBITMAP hbmpMem = CreateDIBSection(hdcMem, &bmi, DIB_RGB_COLORS, &pvBits, NULL, 0);
+    SelectObject(hdcMem, hbmpMem);
+    
+    BYTE alphaValue = g_isTransparent ? 128 : 255;
+    BYTE rTarget = g_isNetworkUp ? 46 : 231;
+    BYTE gTarget = g_isNetworkUp ? 204 : 76;
+    BYTE bTarget = g_isNetworkUp ? 113 : 60;
+    
+    double radius = size / 2.0;
+    double cx = radius, cy = radius;
+    
+    DWORD* pixels = (DWORD*)pvBits;
+    for (int y = 0; y < size; y++) {
+        for (int x = 0; x < size; x++) {
+            double dx = (x + 0.5) - cx;
+            double dy = (y + 0.5) - cy;
+            double dist = sqrt(dx * dx + dy * dy);
+            
+            BYTE a = 0;
+            if (dist <= radius - 0.5) a = alphaValue;
+            else if (dist >= radius + 0.5) a = 0;
+            else a = (BYTE)(alphaValue * (radius + 0.5 - dist));
+            
+            if (a > 0) {
+                pixels[y * size + x] = (a << 24) | (((rTarget * a) / 255) << 16) | (((gTarget * a) / 255) << 8) | ((bTarget * a) / 255);
+            } else pixels[y * size + x] = 0;
+        }
+    }
+    
+    POINT ptSrc = { 0, 0 }, ptDst = { g_posX, g_posY };
+    SIZE sizeWindow = { size, size };
+    BLENDFUNCTION blend = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    UpdateLayeredWindow(g_hwndMain, hdcScreen, &ptDst, &sizeWindow, hdcMem, &ptSrc, 0, &blend, ULW_ALPHA);
+    
+    RestoreDC(hdcMem, nSavedDC);
+    DeleteObject(hbmpMem);
+    DeleteDC(hdcMem);
+    ReleaseDC(NULL, hdcScreen);
+}
+
+// Отрисовка информационного поп-апа (DPI-зависимый layout, авто-ширина)
+void UpdatePopupLayeredWindow(void) {
+    if (!g_hwndPopup) return;
+
+    // --- Определяем DPI текущего монитора ---
+    UINT dpi = 96;
+    HMODULE hUser = GetModuleHandleW(L"user32.dll");
+    if (hUser) {
+        typedef UINT (WINAPI *PFN_GetDpiForWindow)(HWND);
+        PFN_GetDpiForWindow pGetDpi = (PFN_GetDpiForWindow)GetProcAddress(hUser, "GetDpiForWindow");
+        if (pGetDpi && g_hwndMain) dpi = pGetDpi(g_hwndMain);
+    }
+
+    // --- Масштабируемые размеры (в единицах 96 DPI) ---
+    const int H96    = 178;   // высота окна
+    const int PADX96 = 12;    // отступ слева/справа
+    const int PADY96 = 12;    // отступ сверху/снизу
+    const int LINE96 = 21;    // межстрочный шаг
+    const int MINW96 = 260;   // минимальная ширина окна
+
+    int h     = MulDiv(H96,    dpi, 96);
+    int padX  = MulDiv(PADX96, dpi, 96);
+    int padY  = MulDiv(PADY96, dpi, 96);
+    int lineH = MulDiv(LINE96, dpi, 96);
+
+    // --- Измеряем реальную ширину самой длинной строки ---
+    HDC hdcMeasure = GetDC(NULL);
+    SelectObject(hdcMeasure, g_hFontNormal);
+
+    SIZE szRepo  = {0};
+    SIZE szSpeed = {0};
+    GetTextExtentPoint32W(hdcMeasure, L"https://github.com/IgerOK/ping-www", 36, &szRepo);
+    GetTextExtentPoint32W(hdcMeasure, L"Speed In: 000.0 KB/s / 000.0 KB/s", 36, &szSpeed);
+    ReleaseDC(NULL, hdcMeasure);
+
+    int textW = (szRepo.cx > szSpeed.cx) ? szRepo.cx : szSpeed.cx;
+    int w = textW + padX * 2 + MulDiv(8, dpi, 96);
+    int minW = MulDiv(MINW96, dpi, 96);
+    if (w < minW) w = minW;
+
+    HDC hdcScreen = GetDC(NULL);
+    HDC hdcMem = CreateCompatibleDC(hdcScreen);
+    int nSavedDC = SaveDC(hdcMem);
+
+    BITMAPINFO bmi;
+    ZeroMemory(&bmi, sizeof(BITMAPINFO));
+    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth       = w;
+    bmi.bmiHeader.biHeight      = h;
+    bmi.bmiHeader.biPlanes      = 1;
+    bmi.bmiHeader.biBitCount    = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void* pvBits = NULL;
+    HBITMAP hbmpMem = CreateDIBSection(hdcMem, &bmi, DIB_RGB_COLORS, &pvBits, NULL, 0);
+    SelectObject(hdcMem, hbmpMem);
+
+    // --- Фон со скруглёнными углами ---
+    int cornerRadius = MulDiv(8, dpi, 96);
+    DWORD* pixels = (DWORD*)pvBits;
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            BOOL isInside = TRUE;
+            if (x < cornerRadius && y < cornerRadius &&
+                (x-cornerRadius)*(x-cornerRadius)+(y-cornerRadius)*(y-cornerRadius) > cornerRadius*cornerRadius) isInside = FALSE;
+            if (x >= w-cornerRadius && y < cornerRadius &&
+                (x-(w-cornerRadius))*(x-(w-cornerRadius))+(y-cornerRadius)*(y-cornerRadius) > cornerRadius*cornerRadius) isInside = FALSE;
+            if (x < cornerRadius && y >= h-cornerRadius &&
+                (x-cornerRadius)*(x-cornerRadius)+(y-(h-cornerRadius))*(y-(h-cornerRadius)) > cornerRadius*cornerRadius) isInside = FALSE;
+            if (x >= w-cornerRadius && y >= h-cornerRadius &&
+                (x-(w-cornerRadius))*(x-(w-cornerRadius))+(y-(h-cornerRadius))*(y-(h-cornerRadius)) > cornerRadius*cornerRadius) isInside = FALSE;
+
+            if (isInside) {
+                pixels[y * w + x] = (255u << 24); // чёрный, полностью непрозрачный
+            } else {
+                pixels[y * w + x] = 0;
+            }
+        }
+    }
+
+    // --- Статистика ---
+    ULONGLONG currentIn = 0, currentOut = 0;
+    GetTotalNetworkBytes(&currentIn, &currentOut);
+
+    double mbIn  = (double)(currentIn  - g_initialInBytes)  / 1048576.0;
+    double mbOut = (double)(currentOut - g_initialOutBytes) / 1048576.0;
+
+    double avgSpeedInKb = 0.0;
+    if (g_activeInSeconds > 0)
+        avgSpeedInKb  = ((double)(currentIn  - g_initialInBytes)  / 1024.0) / (double)g_activeInSeconds;
+    double avgSpeedOutKb = 0.0;
+    if (g_activeOutSeconds > 0)
+        avgSpeedOutKb = ((double)(currentOut - g_initialOutBytes) / 1024.0) / (double)g_activeOutSeconds;
+
+    wchar_t lineRepo[]    = L"https://github.com/IgerOK/ping-www";
+    wchar_t lineUptime[64];
+    wchar_t lineTraffic[64];
+    wchar_t lineSpeedIn[128];
+    wchar_t lineSpeedOut[128];
+    wchar_t lineHelp1[]   = L"2xLMB: Transp | RMB: Size";
+    wchar_t lineHelp2[]   = L"LMB + Esc: Exit";
+
+    DWORD elapsed = GetTickCount() - g_startTick;
+    swprintf(lineUptime, 64, L"Uptime: %02u:%02u:%02u",
+             elapsed / 3600000, (elapsed / 60000) % 60, (elapsed / 1000) % 60);
+    swprintf(lineTraffic, 64, L"Traffic (In/Out): %.1f / %.1f MB", mbIn, mbOut);
+
+    FormatSpeedString(lineSpeedIn,  128, L"Speed In: ",  g_currentSpeedInKb,  avgSpeedInKb);
+    FormatSpeedString(lineSpeedOut, 128, L"Speed Out:",  g_currentSpeedOutKb, avgSpeedOutKb);
+
+    SetBkMode(hdcMem, TRANSPARENT);
+    SelectObject(hdcMem, g_hFontNormal);
+
+    RECT rcText;
+    rcText.left = padX;
+
+    // --- Основной текст: сверху вниз ---
+    SetTextColor(hdcMem, RGB(255, 255, 0));
+    int top = padY;
+    rcText.top = top; DrawTextW(hdcMem, lineRepo,     -1, &rcText, DT_NOCLIP); top += lineH;
+    rcText.top = top; DrawTextW(hdcMem, lineUptime,   -1, &rcText, DT_NOCLIP); top += lineH;
+    rcText.top = top; DrawTextW(hdcMem, lineTraffic,  -1, &rcText, DT_NOCLIP); top += lineH;
+    rcText.top = top; DrawTextW(hdcMem, lineSpeedIn,  -1, &rcText, DT_NOCLIP); top += lineH;
+    rcText.top = top; DrawTextW(hdcMem, lineSpeedOut, -1, &rcText, DT_NOCLIP);
+
+    // --- Подсказки: снизу вверх, чтобы всегда прижимались к низу окна ---
+    SetTextColor(hdcMem, RGB(200, 180, 0));
+    int helpY2 = h - padY - lineH;
+    int helpY1 = helpY2 - lineH;
+
+    rcText.top = helpY1; DrawTextW(hdcMem, lineHelp1, -1, &rcText, DT_NOCLIP);
+    rcText.top = helpY2; DrawTextW(hdcMem, lineHelp2, -1, &rcText, DT_NOCLIP);
+
+    // --- Корректируем альфа-канал для букв ---
+    for (int i = 0; i < w * h; i++) {
+        DWORD p = pixels[i];
+        if ((p >> 24) == 0 && (p & 0x00FFFFFF) != 0) {
+            pixels[i] |= (255u << 24);
+        }
+    }
+
+    // --- Позиционирование относительно индикатора ---
+    int mainSize = g_sizes[g_sizeLevel];
+    int margin   = MulDiv(8, dpi, 96);
+    int popX = g_posX + mainSize + margin;
+    int popY = g_posY + (mainSize - h) / 2;
+
+    HMONITOR hMonitor = MonitorFromWindow(g_hwndMain, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = { sizeof(MONITORINFO) };
+    if (GetMonitorInfoW(hMonitor, &mi)) {
+        if (popX + w > mi.rcWork.right)  popX = g_posX - w - margin;
+        if (popY < mi.rcWork.top)        popY = mi.rcWork.top;
+        if (popY + h > mi.rcWork.bottom) popY = mi.rcWork.bottom - h;
+    }
+
+    POINT ptSrc = { 0, 0 }, ptDst = { popX, popY };
+    SIZE  sizeWindow = { w, h };
+    BLENDFUNCTION blend = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    UpdateLayeredWindow(g_hwndPopup, hdcScreen, &ptDst, &sizeWindow,
+                        hdcMem, &ptSrc, 0, &blend, ULW_ALPHA);
+
+    RestoreDC(hdcMem, nSavedDC);
+    DeleteObject(hbmpMem);
+    DeleteDC(hdcMem);
+    ReleaseDC(NULL, hdcScreen);
+}
+
+// Обработчик системных сообщений для поп-ап окна
+LRESULT CALLBACK PopupWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
-    case WM_CREATE: {
-        HINSTANCE hInst = ((LPCREATESTRUCTW)lp)->hInstance;
-
-        g_hPopup = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW |
-            WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
-            L"PingWWWTipClass", NULL, WS_POPUP,
-            0, 0, 0, 0,
-            hwnd, NULL, hInst, NULL);
-
-        StartCheck(hwnd);
-        return 0;
-    }
-
-    case WM_TIMER:
-        if (wp == TIMER_CHECK) {
-            KillTimer(hwnd, TIMER_CHECK);
-            StartCheck(hwnd);
-        }
-        return 0;
-
-    case WM_APP_CHECK_DONE: {
-        BOOL ok = (wp != 0);
-        g_firstCheckDone = TRUE;
-        
-        if (ok != g_online) {
-            g_online = ok;
-        }
-        RenderWindow(hwnd, SIZES[g_sizeLevel]);
-        
-        if (g_popupShown) {
-            RenderPopup(g_hPopup);
-            MovePopup(hwnd);
-        }
-        SetTimer(hwnd, TIMER_CHECK,
-                 g_online ? INTERVAL_ONLINE : INTERVAL_OFFLINE, NULL);
-        return 0;
-    }
-
-    case WM_LBUTTONDOWN:
-        g_dragging = TRUE;
-        SetFocus(hwnd);
-        SetCapture(hwnd);
-        GetCursorPos(&g_dragStart);
-        GetWindowRect(hwnd, &g_dragOrigin);
-        ShowPopup(hwnd);
-        return 0;
-
-    case WM_LBUTTONUP:
-        if (g_dragging) {
-            g_dragging = FALSE;
-            ReleaseCapture();
-        }
-        HidePopup();
-        return 0;
-
-    case WM_CAPTURECHANGED:
-        g_dragging = FALSE;
-        HidePopup();
-        return 0;
-
-    case WM_LBUTTONDBLCLK:
-        g_transparent = !g_transparent;
-        RenderWindow(hwnd, SIZES[g_sizeLevel]);
-        return 0;
-
-    case WM_RBUTTONUP:
-        g_sizeLevel = (g_sizeLevel + 1) % SIZES_COUNT;
-        ApplySize(hwnd);
-        return 0;
-
-    case WM_MOUSEMOVE:
-        if (g_dragging) {
-            POINT pt;
-            GetCursorPos(&pt);
-            int dx = pt.x - g_dragStart.x;
-            int dy = pt.y - g_dragStart.y;
-
-            SetWindowPos(hwnd, NULL,
-                         g_dragOrigin.left + dx,
-                         g_dragOrigin.top  + dy,
-                         0, 0,
-                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-            MovePopup(hwnd);
-        }
-        return 0;
-
-    case WM_KEYDOWN:
-        if (wp == VK_ESCAPE && g_dragging) {
-            DestroyWindow(hwnd);
-            return 0;
-        }
-        break;
-
-    case WM_DESTROY:
-        SaveState(hwnd);          /* запомнить позицию, размер и прозрачность */
-        if (g_hPopup) DestroyWindow(g_hPopup);
-        PostQuitMessage(0);
-        return 0;
+        case WM_NCHITTEST: return HTTRANSPARENT;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-/* ---- Точка входа ------------------------------------------------ */
-int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev,
-                   LPSTR cmdLine, int nShow)
-{
-    (void)hPrev; (void)cmdLine; (void)nShow;
-
-    /* Защита от запуска нескольких копий программы (Single Instance) */
-    HANDLE hMutex = CreateMutexW(NULL, TRUE, L"Local\\PingWWW_SingleInstance_Mutex");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        MessageBoxW(NULL, 
-                    L"Программа PingWWW уже запущена.\nЗакройте работающую копию перед запуском новой.",
-                    L"PingWWW", 
-                    MB_OK | MB_ICONINFORMATION | MB_TOPMOST);
-        if (hMutex) CloseHandle(hMutex);
-        return 0; /* Завершаем вторую копию */
-    }
-
-    g_startTick = GetTickCount64();
-
-    INITCOMMONCONTROLSEX icc;
-    icc.dwSize = sizeof(icc);
-    icc.dwICC  = ICC_WIN95_CLASSES | ICC_BAR_CLASSES;
-    InitCommonControlsEx(&icc);
-
-    WNDCLASSEXW wc;
-    ZeroMemory(&wc, sizeof(wc));
-    wc.cbSize        = sizeof(wc);
-    wc.style         = CS_DBLCLKS;
-    wc.lpfnWndProc   = WndProc;
-    wc.hInstance     = hInst;
-    wc.hCursor       = LoadCursorW(NULL, IDC_HAND);
-    wc.hbrBackground = NULL;
-    wc.lpszClassName = L"PingWWWClass";
-    if (!RegisterClassExW(&wc)) { CloseHandle(hMutex); return 1; }
-
-    WNDCLASSEXW wct;
-    ZeroMemory(&wct, sizeof(wct));
-    wct.cbSize        = sizeof(wct);
-    wct.lpfnWndProc   = DefWindowProcW;
-    wct.hInstance     = hInst;
-    wct.hCursor       = LoadCursorW(NULL, IDC_ARROW);
-    wct.lpszClassName = L"PingWWWTipClass";
-    if (!RegisterClassExW(&wct)) { CloseHandle(hMutex); return 1; }
-
-    int posX = 50, posY = 50;
-    /* LoadState считывает X и Y, а также обновляет g_sizeLevel и g_transparent */
-    LoadState(&posX, &posY);
-    
-    int size = SIZES[g_sizeLevel];
-    ClampPosition(&posX, &posY, size);
-
-    HWND hwnd = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
-        L"PingWWWClass", L"WWW",
-        WS_POPUP,
-        posX, posY, size, size,
-        NULL, NULL, hInst, NULL);
+// Главный обработчик событий интерфейса (индикатор)
+LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_CREATE: {
+            g_startTick = GetTickCount();
+            
+            // Создаём шрифт с учётом DPI текущего монитора
+            RecreateFontsForDpi(hwnd);
+            
+            GetTotalNetworkBytes(&g_initialInBytes, &g_initialOutBytes);
+            g_lastInBytes = g_initialInBytes;
+            g_lastOutBytes = g_initialOutBytes;
+            
+            g_hwndPopup = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                POPUP_CLASS_NAME, NULL, WS_POPUP, 0, 0, 1, 1, hwnd, NULL, GetModuleHandle(NULL), NULL);
+                
+            SetTimer(hwnd, ID_TIMER_CHECK, 10, NULL);
+            SetTimer(hwnd, ID_TIMER_SPEED_TRACK, 1000, NULL);
+            return 0;
+        }
         
-    if (!hwnd) {
-        CloseHandle(hMutex);
-        return 1;
+        // Реакция на смену DPI (перетаскивание между мониторами с разным масштабом)
+        case WM_DPICHANGED: {
+            RecreateFontsForDpi(hwnd);
+            if (g_isDragging) UpdatePopupLayeredWindow();
+            return 0;
+        }
+        
+        case WM_TIMER:
+            if (wp == ID_TIMER_CHECK) {
+                KillTimer(hwnd, ID_TIMER_CHECK);
+                if (!g_isChecking) {
+                    g_isChecking = TRUE;
+                    CreateThread(NULL, 0, NetworkCheckThread, hwnd, 0, NULL);
+                }
+            } else if (wp == ID_TIMER_POPUP) {
+                if (g_isDragging) UpdatePopupLayeredWindow();
+            } else if (wp == ID_TIMER_SPEED_TRACK) {
+                ULONGLONG currentIn = 0, currentOut = 0;
+                GetTotalNetworkBytes(&currentIn, &currentOut);
+                
+                ULONGLONG diffIn = currentIn - g_lastInBytes;
+                ULONGLONG diffOut = currentOut - g_lastOutBytes;
+                
+                g_currentSpeedInKb = (double)diffIn / 1024.0;
+                g_currentSpeedOutKb = (double)diffOut / 1024.0;
+                
+                if (diffIn > 0) g_activeInSeconds++;
+                if (diffOut > 0) g_activeOutSeconds++;
+                
+                g_lastInBytes = currentIn;
+                g_lastOutBytes = currentOut;
+            }
+            return 0;
+            
+        case WM_APP_CHECK_DONE: {
+            g_isNetworkUp = (BOOL)wp;
+            g_isChecking = FALSE;
+            UpdateMainLayeredWindow();
+            SetTimer(hwnd, ID_TIMER_CHECK, g_isNetworkUp ? 5000 : 1000, NULL);
+            return 0;
+        }
+        
+        case WM_LBUTTONDOWN: {
+            g_isDragging = TRUE;
+            SetCapture(hwnd);
+            GetCursorPos(&g_dragStartMouse);
+            g_dragStartWindow.x = g_posX; g_dragStartWindow.y = g_posY;
+            
+            UpdatePopupLayeredWindow();
+            ShowWindow(g_hwndPopup, SW_SHOWNOACTIVATE);
+            SetTimer(hwnd, ID_TIMER_POPUP, 100, NULL);
+            return 0;
+        }
+        
+        case WM_MOUSEMOVE: {
+            if (g_isDragging) {
+                POINT pt; GetCursorPos(&pt);
+                g_posX = g_dragStartWindow.x + (pt.x - g_dragStartMouse.x);
+                g_posY = g_dragStartWindow.y + (pt.y - g_dragStartMouse.y);
+                ClampPositionToMonitor(&g_posX, &g_posY, g_sizes[g_sizeLevel]);
+                UpdateMainLayeredWindow();
+                UpdatePopupLayeredWindow();
+            }
+            return 0;
+        }
+        
+        case WM_LBUTTONUP: {
+            if (g_isDragging) {
+                g_isDragging = FALSE;
+                ReleaseCapture();
+                KillTimer(hwnd, ID_TIMER_POPUP);
+                ShowWindow(g_hwndPopup, SW_HIDE);
+            }
+            return 0;
+        }
+        
+        case WM_LBUTTONDBLCLK:
+            g_isTransparent = !g_isTransparent;
+            UpdateMainLayeredWindow();
+            return 0;
+            
+        case WM_RBUTTONDOWN: {
+            int oldSize = g_sizes[g_sizeLevel];
+            g_sizeLevel = (g_sizeLevel + 1) % 3;
+            int newSize = g_sizes[g_sizeLevel];
+            g_posX = g_posX + (oldSize - newSize) / 2;
+            g_posY = g_posY + (oldSize - newSize) / 2;
+            ClampPositionToMonitor(&g_posX, &g_posY, newSize);
+            UpdateMainLayeredWindow();
+            if (g_isDragging) UpdatePopupLayeredWindow();
+            return 0;
+        }
+        
+        case WM_KEYDOWN:
+            if (wp == VK_ESCAPE && g_isDragging) SendMessageW(hwnd, WM_CLOSE, 0, 0);
+            return 0;
+            
+        case WM_CLOSE:
+            SaveSettings();
+            DestroyWindow(hwnd);
+            return 0;
+            
+        case WM_DESTROY:
+            KillTimer(hwnd, ID_TIMER_CHECK);
+            KillTimer(hwnd, ID_TIMER_POPUP);
+            KillTimer(hwnd, ID_TIMER_SPEED_TRACK);
+            if (g_hFontNormal) DeleteObject(g_hFontNormal);
+            PostQuitMessage(0);
+            return 0;
     }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
 
-    RenderWindow(hwnd, size);
-    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-    UpdateWindow(hwnd);
-
+// Главная точка входа WinMain
+int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
+    // Включаем per-monitor DPI-awareness ДО создания окон.
+    // Без этого Windows растягивает всё окно целиком, что мылит текст.
+    HMODULE hUser = GetModuleHandleW(L"user32.dll");
+    if (hUser) {
+        typedef BOOL (WINAPI *PFN_SetCtx)(HANDLE);
+        PFN_SetCtx pSetCtx = (PFN_SetCtx)GetProcAddress(hUser, "SetProcessDpiAwarenessContext");
+        if (pSetCtx) {
+            // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = (HANDLE)-4
+            pSetCtx((HANDLE)-4);
+        } else {
+            // Fallback для Windows 7/8
+            SetProcessDPIAware();
+        }
+    }
+    
+    HANDLE hMutex = CreateMutexW(NULL, TRUE, L"PingWWW_SingleInstance_Mutex");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        MessageBoxW(NULL, L"Программа PingWWW уже запущена!", L"Предупреждение", MB_OK | MB_ICONWARNING);
+        return 0;
+    }
+    
+    LoadSettings();
+    
+    WNDCLASSEXW wc;
+    ZeroMemory(&wc, sizeof(WNDCLASSEXW));
+    wc.cbSize = sizeof(WNDCLASSEXW);
+    wc.lpfnWndProc = MainWndProc;
+    wc.hInstance = hInst;
+    wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.lpszClassName = WINDOW_CLASS_NAME;
+    wc.style = CS_DBLCLKS; 
+    RegisterClassExW(&wc);
+    
+    wc.lpfnWndProc = PopupWndProc;
+    wc.lpszClassName = POPUP_CLASS_NAME;
+    wc.style = 0;
+    RegisterClassExW(&wc);
+    
+    int currentSize = g_sizes[g_sizeLevel];
+    g_hwndMain = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        WINDOW_CLASS_NAME, L"PingWWW", WS_POPUP,
+        g_posX, g_posY, currentSize, currentSize, NULL, NULL, hInst, NULL);
+        
+    if (!g_hwndMain) return 0;
+    
+    ShowWindow(g_hwndMain, nShow);
+    UpdateWindow(g_hwndMain);
+    UpdateMainLayeredWindow();
+    
     MSG msg;
-    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+    while (GetMessageW(&msg, NULL, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
-
-    /* При нормальном завершении ОС освободит мьютекс сама, 
-       но явное закрытие дескриптора — это good practice */
+    
+    ReleaseMutex(hMutex);
     CloseHandle(hMutex);
     return (int)msg.wParam;
 }
-
