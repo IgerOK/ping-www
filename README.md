@@ -147,9 +147,9 @@ ping-www/
 ├── PingWWW.ppj
 ├── PingWWW.exe
 ├── compiler-defines.png
-└── linker-libraries.png
+├── linker-libraries.png
+└── screenshot.png
 ```
-
 ## Лицензия
 
 MIT
